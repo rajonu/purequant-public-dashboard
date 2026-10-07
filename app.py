@@ -1,6 +1,9 @@
 import os
 import json
+import time
+import threading
 from datetime import datetime, timezone
+from urllib.request import Request, urlopen
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -30,7 +33,54 @@ FORBIDDEN_FIELDS = {
 }
 
 DATA_PATH = os.getenv("PUBLIC_METRICS_PATH", "/app/data/public_metrics.json")
+PAPER_MONITOR_STATE_PATH = os.getenv("PAPER_MONITOR_STATE_PATH", "/app/monitoring/paper_trades.json")
 STALE_THRESHOLD_SECONDS = 300  # 5 minutes
+SCANNER_SIGNALS_URL = os.getenv(
+    "SCANNER_SIGNALS_URL",
+    "https://scanner.purequantai.xyz/api/v2/signals?actionable=true",
+)
+SCANNER_CACHE_TTL_SECONDS = 10
+_scanner_cache_lock = threading.Lock()
+_scanner_cache = {"checked_at": 0.0, "signals": [], "state": "disconnected", "error": None}
+
+
+def get_scanner_signals(force=False):
+    """Fetch the public scanner gateway and retain the last good snapshot on errors."""
+    now = time.monotonic()
+    with _scanner_cache_lock:
+        if not force and now - _scanner_cache["checked_at"] < SCANNER_CACHE_TTL_SECONDS:
+            return dict(_scanner_cache)
+
+        try:
+            request = Request(SCANNER_SIGNALS_URL, headers={"User-Agent": "PureQuantPublicDashboard/1.0"})
+            with urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            signals = payload.get("signals") if isinstance(payload, dict) else None
+            if not isinstance(signals, list) or any(
+                not isinstance(signal, dict) or not signal.get("signal_id")
+                or not isinstance(signal.get("trade_plan"), dict)
+                for signal in signals
+            ):
+                raise ValueError("Scanner response has an invalid signals payload")
+
+            _scanner_cache.update({
+                "checked_at": time.monotonic(),
+                "signals": signals,
+                "state": "connected",
+                "error": None,
+                "generated_at": payload.get("generated_at"),
+                "total": payload.get("total", len(signals)),
+                "gateway": SCANNER_SIGNALS_URL,
+            })
+        except Exception as exc:
+            had_snapshot = bool(_scanner_cache["checked_at"])
+            _scanner_cache.update({
+                "checked_at": time.monotonic(),
+                "state": "degraded" if had_snapshot else "disconnected",
+                "error": str(exc)[:240],
+                "gateway": SCANNER_SIGNALS_URL,
+            })
+        return dict(_scanner_cache)
 
 def load_and_validate_metrics():
     if not os.path.exists(DATA_PATH):
@@ -75,6 +125,15 @@ def load_and_validate_metrics():
             is_stale = True
 
     return sanitized, is_stale, None
+
+
+def load_paper_monitor_state():
+    try:
+        with open(PAPER_MONITOR_STATE_PATH, "r") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -138,6 +197,14 @@ HTML_TEMPLATE = """
 
         <!-- Top Metrics Row -->
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+            <div id="scanner-api-card" class="card p-4 border-slate-500/40">
+                <div class="flex justify-between items-center">
+                    <span class="text-xs font-bold text-[#8b949e] uppercase tracking-wider">Scanner API</span>
+                    <span id="scanner-api-dot" class="w-2 h-2 rounded-full bg-slate-400"></span>
+                </div>
+                <div id="scanner-api-status" class="text-base font-black text-slate-300 mt-2">CONNECTING</div>
+                <div id="scanner-api-detail" class="text-[11px] text-[#8b949e] mt-1">Checking scanner gateway…</div>
+            </div>
             <div class="card p-4 border-emerald-500/40">
                 <div class="flex justify-between items-center">
                     <span class="text-xs font-bold text-[#8b949e] uppercase tracking-wider">Net Return</span>
@@ -177,6 +244,15 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
+            <div class="card p-4 border-cyan-500/40">
+                <div class="flex justify-between items-center">
+                    <span class="text-xs font-bold text-[#8b949e] uppercase tracking-wider">Active Trades</span>
+                    <span class="text-[10px] font-black px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300">PAPER</span>
+                </div>
+                <div id="active-trades-count" class="text-2xl font-black text-cyan-300 mt-1">0 Open</div>
+                <div class="text-[11px] text-[#8b949e] mt-1">Price and PnL monitoring</div>
+            </div>
+
             <div class="card p-4 border-purple-500/40">
                 <div class="flex justify-between items-center">
                     <span class="text-xs font-bold text-[#8b949e] uppercase tracking-wider">System Health</span>
@@ -205,6 +281,10 @@ HTML_TEMPLATE = """
                 <span>📜 Signal History (PnL %)</span>
                 <span id="badge-history-count" class="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-300">20 of {{ metrics.closed_signals|length }}</span>
             </button>
+            <button onclick="switchTab('trades')" id="tab-btn-trades" class="tab-btn px-4 py-2 text-sm font-bold flex items-center gap-2">
+                <span>📈 Active Trades</span>
+                <span id="badge-paper-trades" class="px-2 py-0.5 text-xs rounded-full bg-emerald-500/20 text-emerald-300">0</span>
+            </button>
             <button onclick="switchTab('health')" id="tab-btn-health" class="tab-btn px-4 py-2 text-sm font-bold flex items-center gap-2">
                 <span>🏥 System & Module Health</span>
                 {% if metrics.system_health and metrics.system_health.overall == 'operational' %}
@@ -215,9 +295,32 @@ HTML_TEMPLATE = """
             </button>
         </div>
 
+        <!-- Paper monitored trades -->
+        <div id="tab-content-trades" class="card overflow-hidden hidden">
+            <div class="px-4 py-3 border-b border-[#30363d] bg-[#161b22]">
+                <div class="text-xs font-bold text-white">Paper Monitored Trades</div>
+                <div id="paper-fee-note" class="text-[11px] text-[#8b949e] mt-1">Paper only • signal reference entries • Binance spot prices • TP1 arms break-even; TP3 closes • no partial exits</div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-[#21262d] text-[#8b949e] uppercase font-bold border-b border-[#30363d]"><tr>
+                        <th class="p-3">Asset</th><th class="p-3">Side</th><th class="p-3">Live Return</th><th class="p-3">Net PnL (est.)</th><th class="p-3">Monitor State</th><th class="p-3">Chart</th>
+                    </tr></thead>
+                    <tbody id="paper-trades-tbody" class="divide-y divide-[#30363d]"></tbody>
+                </table>
+            </div>
+            <div id="paper-trades-empty" class="p-8 text-center text-[#8b949e]">
+                <p class="text-sm font-semibold">No paper trades have reached their entry reference yet.</p>
+                <p class="text-xs mt-1">Actionable signals are monitored continuously; a paper trade starts only after market price reaches its entry.</p>
+            </div>
+        </div>
+
         <!-- Tab 1: Active Signals -->
         <div id="tab-content-active" class="card overflow-hidden">
-            {% if metrics.active_signals %}
+            <div class="px-4 py-3 border-b border-[#30363d] bg-[#161b22]">
+                <div class="text-xs font-bold text-white">Active Signals</div>
+                <div class="text-[11px] text-[#8b949e] mt-1">API Gateway: <a id="signal-api-link" href="https://scanner.purequantai.xyz/api/v2/signals?actionable=true" target="_blank" rel="noopener noreferrer" class="text-[#58a6ff] hover:underline">scanner.purequantai.xyz/api/v2/signals?actionable=true</a></div>
+            </div>
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
                     <thead class="bg-[#21262d] text-[#8b949e] uppercase font-bold border-b border-[#30363d]">
@@ -257,12 +360,10 @@ HTML_TEMPLATE = """
                     </tbody>
                 </table>
             </div>
-            {% else %}
-            <div class="p-8 text-center text-[#8b949e]">
+            <div id="active-signals-empty" class="p-8 text-center text-[#8b949e] {% if metrics.active_signals %}hidden{% endif %}">
                 <p class="text-sm font-semibold">No actionable signals currently meet the 95+ confluence threshold.</p>
-                <p class="text-xs mt-1">PureQuant V2 Scanner is actively monitoring 198 crypto assets across Binance & Spot liquidity pools.</p>
+                <p class="text-xs mt-1">Signals will appear here when the scanner gateway returns actionable entries.</p>
             </div>
-            {% endif %}
         </div>
 
         <!-- Tab 2: Signal History -->
@@ -274,10 +375,8 @@ HTML_TEMPLATE = """
                             <th class="p-3">Asset</th>
                             <th class="p-3">Direction</th>
                             <th class="p-3">Result</th>
-                            <th class="p-3">Return (PnL %)</th>
-                            <th class="p-3">Entry Price</th>
-                            <th class="p-3">Exit Price</th>
-                            <th class="p-3">Exit Time (UTC)</th>
+                            <th class="p-3">Net Return (PnL %)</th>
+                            <th class="p-3">Closed (UTC)</th>
                         </tr>
                     </thead>
                     <tbody id="history-signals-tbody" class="divide-y divide-[#30363d]">
@@ -290,15 +389,13 @@ HTML_TEMPLATE = """
                                 </span>
                             </td>
                             <td class="p-3">
-                                <span class="px-2 py-0.5 rounded font-black text-[10px] {% if 'WIN' in t.status %}bg-emerald-500/20 text-emerald-400{% else %}bg-red-500/20 text-red-400{% endif %}">
+                                <span class="px-2 py-0.5 rounded font-black text-[10px] {% if t.status in ['TP', 'WIN'] %}bg-emerald-500/20 text-emerald-400{% elif t.status == 'BREAKEVEN' %}bg-yellow-500/20 text-yellow-400{% else %}bg-red-500/20 text-red-400{% endif %}">
                                     {{ t.status }}
                                 </span>
                             </td>
                             <td class="p-3 font-mono font-bold {% if t.pnl_pct > 0 %}text-emerald-400{% elif t.pnl_pct < 0 %}text-red-400{% else %}text-[#8b949e]{% endif %}">
                                 {% if t.pnl_pct > 0 %}+{% endif %}{{ "%.2f"|format(t.pnl_pct) }}%
                             </td>
-                            <td class="p-3 font-mono text-[#8b949e]">${{ t.entry_price }}</td>
-                            <td class="p-3 font-mono text-white">${{ t.exit_price }}</td>
                             <td class="p-3 text-[#8b949e] font-mono text-[11px]">{{ t.exit_time }}</td>
                         </tr>
                         {% endfor %}
@@ -387,7 +484,7 @@ HTML_TEMPLATE = """
 
         function renderHistoryTable() {
             const tbody = document.getElementById('history-signals-tbody');
-            if (!tbody || !cachedClosedSignals || cachedClosedSignals.length === 0) return;
+            if (!tbody || !cachedClosedSignals) return;
 
             const total = cachedClosedSignals.length;
             const totalPages = Math.ceil(total / historyPageSize) || 1;
@@ -414,17 +511,15 @@ HTML_TEMPLATE = """
             let rows = '';
             displaySignals.forEach(t => {
                 const dirBg = (t.direction === 'BUY' || t.direction === 'LONG') ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400';
-                const statusBg = (t.status && t.status.includes('WIN')) ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400';
+                const statusBg = t.status === 'TP' || t.status === 'WIN' ? 'bg-emerald-500/20 text-emerald-400' : (t.status === 'BREAKEVEN' ? 'bg-yellow-500/20 text-yellow-400' : (t.status === 'NOT ENTERED' ? 'bg-slate-500/20 text-slate-300' : 'bg-red-500/20 text-red-400'));
                 const pnlClass = t.pnl_pct > 0 ? 'text-emerald-400' : (t.pnl_pct < 0 ? 'text-red-400' : 'text-[#8b949e]');
                 const pnlSign = t.pnl_pct > 0 ? '+' : '';
 
                 rows += `<tr class="hover:bg-[#1c2128] transition-colors">
-                    <td class="p-3 font-bold text-white">${t.pair}</td>
-                    <td class="p-3"><span class="px-2 py-0.5 rounded font-black text-[10px] ${dirBg}">${t.direction}</span></td>
-                    <td class="p-3"><span class="px-2 py-0.5 rounded font-black text-[10px] ${statusBg}">${t.status}</span></td>
+                    <td class="p-3 font-bold text-white">${escapeHtml(t.pair)}</td>
+                    <td class="p-3"><span class="px-2 py-0.5 rounded font-black text-[10px] ${dirBg}">${escapeHtml(t.direction)}</span></td>
+                    <td class="p-3"><span class="px-2 py-0.5 rounded font-black text-[10px] ${statusBg}">${escapeHtml(t.status)}</span></td>
                     <td class="p-3 font-mono font-bold ${pnlClass}">${pnlSign}${Number(t.pnl_pct).toFixed(2)}%</td>
-                    <td class="p-3 font-mono text-[#8b949e]">$${t.entry_price}</td>
-                    <td class="p-3 font-mono text-white">$${t.exit_price}</td>
                     <td class="p-3 text-[#8b949e] font-mono text-[11px]">${t.exit_time}</td>
                 </tr>`;
             });
@@ -436,7 +531,7 @@ HTML_TEMPLATE = """
             const totalEl = document.getElementById('history-total-count');
             if (totalEl) totalEl.innerText = total;
             const badgeEl = document.getElementById('badge-history-count');
-            if (badgeEl) badgeEl.innerText = `${rangeEnd - rangeStart + 1} of ${total}`;
+            if (badgeEl) badgeEl.innerText = `${total ? rangeEnd - rangeStart + 1 : 0} of ${total}`;
 
             // Update Pagination buttons & indicator
             const prevBtn = document.getElementById('btn-history-prev');
@@ -450,8 +545,8 @@ HTML_TEMPLATE = """
                     : `Page ${historyCurrentPage} of ${totalPages}`;
             }
 
-            if (prevBtn) prevBtn.disabled = (historyCurrentPage <= 1 || historyDisplayMode === 'loadmore');
-            if (nextBtn) nextBtn.disabled = (historyCurrentPage >= totalPages || historyDisplayMode === 'loadmore');
+            if (prevBtn) prevBtn.disabled = (historyCurrentPage <= 1 || historyDisplayMode === 'loadmore' || total === 0);
+            if (nextBtn) nextBtn.disabled = (historyCurrentPage >= totalPages || historyDisplayMode === 'loadmore' || total === 0);
             if (loadMoreBtn) {
                 loadMoreBtn.disabled = (rangeEnd >= total);
                 loadMoreBtn.style.opacity = (rangeEnd >= total) ? '0.3' : '1';
@@ -481,7 +576,7 @@ HTML_TEMPLATE = """
 
         function switchTab(tabName) {
             currentTab = tabName;
-            const tabs = ['active', 'history', 'health'];
+            const tabs = ['active', 'trades', 'history', 'health'];
             tabs.forEach(t => {
                 const content = document.getElementById("tab-content-" + t);
                 const btn = document.getElementById("tab-btn-" + t);
@@ -508,6 +603,127 @@ HTML_TEMPLATE = """
             }
         }
 
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+        }
+
+        function displayPrice(value) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n.toLocaleString('en-US', {maximumSignificantDigits: 8}) : '—';
+        }
+
+        async function fetchScannerSignals() {
+            const status = document.getElementById('scanner-api-status');
+            const detail = document.getElementById('scanner-api-detail');
+            const dot = document.getElementById('scanner-api-dot');
+            const card = document.getElementById('scanner-api-card');
+            try {
+                const response = await fetch('/api/scanner/signals', {cache: 'no-store'});
+                const data = await response.json();
+                const state = data.state || 'disconnected';
+                const connected = state === 'connected';
+                const color = connected ? 'emerald' : 'red';
+                if (status) {
+                    status.innerText = connected ? 'API CONNECTED • SYNCHRONIZING' : state.toUpperCase();
+                    status.className = `text-base font-black mt-2 text-${color}-400`;
+                }
+                if (dot) dot.className = `w-2 h-2 rounded-full bg-${color}-400 ${connected ? 'animate-pulse' : ''}`;
+                if (card) card.className = `card p-4 border-${color}-500/40`;
+                if (detail) {
+                    const count = Number(data.total ?? (data.signals || []).length);
+                    const generated = data.generated_at ? new Date(data.generated_at).toLocaleTimeString() : '';
+                    detail.innerText = connected
+                        ? `${count} actionable signals • Synchronizing${generated ? ' • API ' + generated : ''}`
+                        : (state === 'degraded' ? 'Last API snapshot retained • Retrying gateway' : 'Scanner API unavailable • Retrying gateway');
+                }
+                renderScannerSignals(Array.isArray(data.signals) ? data.signals : []);
+            } catch (err) {
+                if (status) { status.innerText = 'DISCONNECTED'; status.className = 'text-base font-black mt-2 text-red-400'; }
+                if (dot) dot.className = 'w-2 h-2 rounded-full bg-red-400';
+                if (card) card.className = 'card p-4 border-red-500/40';
+                if (detail) detail.innerText = 'Scanner API unavailable • Retrying gateway';
+            }
+        }
+
+        async function fetchPaperMonitor() {
+            try {
+                const response = await fetch('/api/paper-trades', {cache: 'no-store'});
+                const data = await response.json();
+                renderPaperTrades(Array.isArray(data.active_trades) ? data.active_trades : []);
+                cachedClosedSignals = Array.isArray(data.history) ? data.history.slice(0, 100) : [];
+                renderHistoryTable();
+                const feeNote = document.getElementById('paper-fee-note');
+                if (feeNote) feeNote.innerText = `Paper only • Binance spot prices • estimated fees ${Number(data.fee_per_side_pct || 0).toFixed(2)}% per side • TP1 arms break-even; TP3 closes; no partial exits`;
+                const syncTimeEl = document.getElementById('footer-sync-time');
+                if (syncTimeEl && data.updated_at) syncTimeEl.innerText = 'Monitor: ' + data.updated_at.slice(0, 19).replace('T', ' ') + ' UTC';
+            } catch (err) {
+                console.debug('Paper monitor sync pending...', err);
+            }
+        }
+
+        function formatPct(value) {
+            const n = Number(value);
+            return Number.isFinite(n) ? `${n > 0 ? '+' : ''}${n.toFixed(2)}%` : '—';
+        }
+
+        function renderPaperTrades(trades) {
+            const tbody = document.getElementById('paper-trades-tbody');
+            const empty = document.getElementById('paper-trades-empty');
+            const badge = document.getElementById('badge-paper-trades');
+            const summary = document.getElementById('active-trades-count');
+            if (badge) badge.innerText = trades.length;
+            if (summary) summary.innerText = `${trades.length} Open`;
+            if (empty) empty.classList.toggle('hidden', trades.length > 0);
+            if (!tbody) return;
+            tbody.innerHTML = trades.map(trade => {
+                const signal = trade.signal || {};
+                const symbol = String(trade.symbol || signal.symbol || '');
+                const side = signal.direction || (trade.plan || {}).direction || 'LONG';
+                const net = Number(trade.live_net_pnl_pct);
+                const gross = Number(trade.live_gross_pnl_pct);
+                const pnlColor = Number.isFinite(net) ? (net > 0 ? 'text-emerald-400' : net < 0 ? 'text-red-400' : 'text-[#8b949e]') : 'text-[#8b949e]';
+                const state = trade.breakeven_armed ? 'Break-even stop armed' : (trade.tp2_reached ? 'TP2 reached • monitoring' : 'Live monitoring');
+                const tvSymbol = encodeURIComponent(`BINANCE:${symbol}`);
+                const chartUrl = `https://www.tradingview.com/chart/?symbol=${tvSymbol}`;
+                return `<tr class="hover:bg-[#1c2128] transition-colors">
+                    <td class="p-3 font-bold text-white">${escapeHtml(symbol)}</td>
+                    <td class="p-3"><span class="px-2 py-0.5 rounded font-black text-[10px] ${side === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}">${side === 'LONG' ? 'BUY' : 'SELL'}</span></td>
+                    <td class="p-3 font-mono font-bold ${Number.isFinite(gross) && gross >= 0 ? 'text-emerald-400' : 'text-red-400'}">${formatPct(gross)}</td>
+                    <td class="p-3 font-mono font-bold ${pnlColor}">${formatPct(net)}</td>
+                    <td class="p-3 text-[#8b949e]">${state}</td>
+                    <td class="p-3"><a href="${chartUrl}" target="_blank" rel="noopener noreferrer" class="text-[#58a6ff] hover:underline">TradingView ↗</a></td>
+                </tr>`;
+            }).join('');
+        }
+
+        function renderScannerSignals(signals) {
+            const tbody = document.getElementById('active-signals-tbody');
+            const empty = document.getElementById('active-signals-empty');
+            const count = document.getElementById('metric-active-count');
+            const badge = document.getElementById('badge-active-count');
+            if (count) count.innerText = `${signals.length} Ready`;
+            if (badge) badge.innerText = signals.length;
+            if (empty) empty.classList.toggle('hidden', signals.length > 0);
+            if (!tbody) return;
+
+            tbody.innerHTML = signals.map(signal => {
+                const plan = signal.trade_plan || {};
+                const symbol = escapeHtml(signal.symbol || 'Unknown');
+                const direction = escapeHtml(signal.direction || plan.direction || 'LONG');
+                const dirBg = direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400';
+                return `<tr class="hover:bg-[#1c2128] transition-colors">
+                    <td class="p-3 font-bold text-white"><span class="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-2 animate-pulse"></span>${symbol}</td>
+                    <td class="p-3"><span class="px-2 py-0.5 rounded font-black text-[10px] ${dirBg}">${direction}</span></td>
+                    <td class="p-3 font-mono font-bold text-[#58a6ff]">${escapeHtml(signal.score ?? '—')}/100</td>
+                    <td class="p-3 text-[#8b949e] font-mono">${escapeHtml(signal.setup_type || '')}</td>
+                    <td class="p-3 font-mono text-white">$${displayPrice(plan.entry_reference)}</td>
+                    <td class="p-3 font-mono text-emerald-400">$${displayPrice(plan.tp1)} <span class="text-[#8b949e]">|</span> $${displayPrice(plan.tp2)} <span class="text-[#8b949e]">|</span> $${displayPrice(plan.tp3)}</td>
+                    <td class="p-3 font-mono text-red-400">$${displayPrice(plan.stop_loss)}</td>
+                    <td class="p-3 font-mono text-purple-400">1:${escapeHtml(plan.risk_reward ?? '—')}</td>
+                </tr>`;
+            }).join('');
+        }
+
         function updateUI(data) {
             if (!data) return;
 
@@ -520,54 +736,6 @@ HTML_TEMPLATE = """
             if (winEl && data.win_rate_pct !== undefined) {
                 winEl.innerText = Number(data.win_rate_pct).toFixed(1) + '%';
             }
-            const actCountEl = document.getElementById('metric-active-count');
-            const actBadgeEl = document.getElementById('badge-active-count');
-            if (data.active_signals) {
-                if (actCountEl) actCountEl.innerText = data.active_signals.length + ' Ready';
-                if (actBadgeEl) actBadgeEl.innerText = data.active_signals.length;
-            }
-            if (data.closed_signals) {
-                cachedClosedSignals = data.closed_signals;
-                renderHistoryTable();
-            }
-
-            // Update Active Signals Table
-            const activeTableBody = document.getElementById('active-signals-tbody');
-            const activeEmpty = document.getElementById('active-signals-empty');
-            if (activeTableBody) {
-                if (data.active_signals && data.active_signals.length > 0) {
-                    if (activeEmpty) activeEmpty.classList.add('hidden');
-                    activeTableBody.parentElement.parentElement.classList.remove('hidden');
-                    let rows = '';
-                    data.active_signals.forEach(s => {
-                        const dirBg = s.direction === 'LONG' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400';
-                        rows += `<tr class="hover:bg-[#1c2128] transition-colors">
-                            <td class="p-3 font-bold text-white flex items-center gap-2">
-                                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                                ${s.symbol}
-                            </td>
-                            <td class="p-3">
-                                <span class="px-2 py-0.5 rounded font-black text-[10px] ${dirBg}">
-                                    ${s.direction}
-                                </span>
-                            </td>
-                            <td class="p-3 font-mono font-bold text-[#58a6ff]">${Math.round(s.score)}/100</td>
-                            <td class="p-3 text-[#8b949e] font-mono">${s.setup || ''}</td>
-                            <td class="p-3 font-mono text-white">$${s.entry_reference}</td>
-                            <td class="p-3 font-mono text-emerald-400">
-                                $${s.tp1} <span class="text-[#8b949e]">|</span> $${s.tp2} <span class="text-[#8b949e]">|</span> $${s.tp3}
-                            </td>
-                            <td class="p-3 font-mono text-red-400">$${s.stop_loss}</td>
-                            <td class="p-3 font-mono text-purple-400">1:${s.risk_reward}</td>
-                        </tr>`;
-                    });
-                    activeTableBody.innerHTML = rows;
-                } else {
-                    activeTableBody.innerHTML = '';
-                    if (activeEmpty) activeEmpty.classList.remove('hidden');
-                }
-            }
-
             // Update footer sync time
             const syncTimeEl = document.getElementById('footer-sync-time');
             if (syncTimeEl && data.updated_at) {
@@ -576,8 +744,13 @@ HTML_TEMPLATE = """
         }
 
         // Initial load of history on page render
+        renderHistoryTable();
         fetchMetricsAndUpdate();
+        fetchScannerSignals();
+        fetchPaperMonitor();
         setInterval(fetchMetricsAndUpdate, 5000);
+        setInterval(fetchScannerSignals, 15000);
+        setInterval(fetchPaperMonitor, 15000);
     </script>
 </body>
 </html>
@@ -586,6 +759,9 @@ HTML_TEMPLATE = """
 @app.route("/")
 def index():
     metrics, is_stale, err = load_and_validate_metrics()
+    if metrics:
+        paper_state = load_paper_monitor_state()
+        metrics["closed_signals"] = paper_state.get("history", [])[:100]
     sync_time = str(metrics.get("updated_at", ""))[:19].replace("T", " ") if metrics else "N/A"
     return render_template_string(HTML_TEMPLATE, metrics=metrics, is_stale=is_stale, error_message=err, sync_time=sync_time)
 
@@ -610,6 +786,35 @@ def public_metrics():
             "message": "Performance temporarily unavailable"
         }), 503
     return jsonify(metrics), 200
+
+@app.route("/api/scanner/signals")
+def scanner_signals():
+    snapshot = get_scanner_signals()
+    response = {
+        "state": snapshot["state"],
+        "signals": snapshot.get("signals", []),
+        "total": snapshot.get("total", len(snapshot.get("signals", []))),
+        "generated_at": snapshot.get("generated_at"),
+        "gateway": snapshot.get("gateway", SCANNER_SIGNALS_URL),
+    }
+    if snapshot.get("error"):
+        response["error"] = snapshot["error"]
+    return jsonify(response), 200
+
+@app.route("/api/paper-trades")
+def paper_trades():
+    state = load_paper_monitor_state()
+    history = state.get("history", [])
+    return jsonify({
+        "monitor_state": state.get("monitor_state", "starting"),
+        "scanner_state": state.get("scanner_state", "disconnected"),
+        "market_state": state.get("market_state", "disconnected"),
+        "updated_at": state.get("updated_at"),
+        "fee_per_side_pct": state.get("fee_per_side_pct", 0.1),
+        "watchlist": state.get("watchlist", []),
+        "active_trades": state.get("active_trades", []),
+        "history": history[:100],
+    }), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8060, debug=False)

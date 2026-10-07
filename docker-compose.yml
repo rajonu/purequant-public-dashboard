@@ -8,9 +8,31 @@ services:
     volumes:
       - ./app.py:/app/app.py:ro
       - ./data:/app/data:ro
+      - ./monitoring:/app/monitoring:ro
     environment:
       - PYTHONUNBUFFERED=1
       - PUBLIC_METRICS_PATH=/app/data/public_metrics.json
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  paper-monitor:
+    build: .
+    container_name: purequant-paper-monitor
+    command: ["python", "monitor.py"]
+    restart: unless-stopped
+    volumes:
+      - ./monitor.py:/app/monitor.py:ro
+      - ./monitoring:/app/monitoring:rw
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SCANNER_SIGNALS_URL=https://scanner.purequantai.xyz/api/v2/signals?actionable=true
+      - BINANCE_BASE_URL=https://api.binance.com
+      - PAPER_MONITOR_POLL_SECONDS=15
+      - PAPER_FEE_PERCENT_PER_SIDE=0.1
+      - PAPER_MONITOR_STATE_PATH=/app/monitoring/paper_trades.json
     security_opt:
       - no-new-privileges:true
     read_only: true
