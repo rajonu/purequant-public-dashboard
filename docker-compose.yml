@@ -38,3 +38,5 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    healthcheck:
+      disable: true
