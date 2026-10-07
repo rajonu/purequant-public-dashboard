@@ -6,6 +6,7 @@ services:
     ports:
       - "127.0.0.1:8060:8060"
     volumes:
+      - ./app.py:/app/app.py:ro
       - ./data:/app/data:ro
     environment:
       - PYTHONUNBUFFERED=1
