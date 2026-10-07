@@ -1,0 +1,17 @@
+services:
+  public-dashboard:
+    build: .
+    container_name: purequant-public-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8060:8060"
+    volumes:
+      - ./data:/app/data:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PUBLIC_METRICS_PATH=/app/data/public_metrics.json
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
