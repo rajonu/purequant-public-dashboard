@@ -251,8 +251,25 @@ def run_cycle(state):
         state["scanner_error"] = str(exc)[:240]
         signals = state.get("signals", [])
 
-    watchlist = {w["signal_id"]: w for w in state.get("watchlist", [])}
-    active = {t["signal_id"]: t for t in state.get("active_trades", [])}
+    # A scanner can emit a fresh signal_id every minute for the same market.
+    # Paper monitoring therefore keeps only the oldest open entry per symbol.
+    active = {}
+    active_symbols = set()
+    for trade in sorted(state.get("active_trades", []), key=lambda t: t.get("opened_at", "")):
+        sid = trade.get("signal_id")
+        symbol = binance_symbol(trade.get("signal") or {"symbol": trade.get("symbol", "")})
+        if sid and symbol and symbol not in active_symbols:
+            active[sid] = trade
+            active_symbols.add(symbol)
+
+    watchlist = {}
+    watched_symbols = set()
+    for watch in sorted(state.get("watchlist", []), key=lambda w: w.get("created_at", "")):
+        sid = watch.get("signal_id")
+        symbol = binance_symbol(watch.get("signal") or {"symbol": watch.get("symbol", "")})
+        if sid and symbol and symbol not in active_symbols and symbol not in watched_symbols:
+            watchlist[sid] = watch
+            watched_symbols.add(symbol)
     closed_ids = {h["signal_id"] for h in state.get("history", [])}
 
     for signal in signals:
@@ -262,8 +279,8 @@ def run_cycle(state):
                 watchlist[sid]["signal"] = signal
             continue
         symbol = binance_symbol(signal)
-        # The state maps are keyed by signal_id, so a signal can have at most
-        # one watcher or one open paper trade, while separate signals remain independent.
+        if symbol and (symbol in active_symbols or symbol in watched_symbols):
+            continue
         timing = signal.get("timing") or {}
         created_ms = parse_time_ms(timing.get("created_at")) or int(time.time() * 1000)
         # Ignore the signal's partial creation minute so earlier price action cannot count as an entry.
@@ -278,6 +295,8 @@ def run_cycle(state):
             "first_full_bar_ms": first_full_bar,
             "last_bar_open_ms": first_full_bar - 60000,
         }
+        if symbol:
+            watched_symbols.add(symbol)
 
     needed = {binance_symbol(w["signal"]) for w in watchlist.values()}
     needed.update(binance_symbol(t["signal"]) for t in active.values())
@@ -349,6 +368,7 @@ def run_cycle(state):
                 "last_bar_open_ms": open_ms,
             }
             active[sid] = trade
+            active_symbols.add(symbol)
             del watchlist[sid]
             outcome = process_trade_candle(state, trade, candle, is_new_entry=True)
             if outcome == "closed":
