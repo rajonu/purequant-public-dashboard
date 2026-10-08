@@ -2,6 +2,7 @@
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,7 @@ SCANNER_URL = os.getenv(
     "SCANNER_SIGNALS_URL",
     "https://scanner.purequantai.xyz/api/v2/signals?actionable=true",
 )
-BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision")
 STATE_PATH = Path(os.getenv("PAPER_MONITOR_STATE_PATH", "/app/monitoring/paper_trades.json"))
 POLL_SECONDS = max(5, int(os.getenv("PAPER_MONITOR_POLL_SECONDS", "15")))
 FEE_PER_SIDE_PCT = max(0.0, float(os.getenv("PAPER_FEE_PERCENT_PER_SIDE", "0.1")))
@@ -100,14 +101,48 @@ def fetch_scanner():
     return data, [s for s in signals if isinstance(s, dict) and s.get("signal_id") and trade_plan(s)]
 
 
-def fetch_prices():
+def fetch_prices(symbols=None):
+    if symbols:
+        # Request only monitored pairs to reduce payload and surface missing symbols clearly.
+        with ThreadPoolExecutor(max_workers=min(32, len(symbols))) as pool:
+            futures = {pool.submit(request_json, f"{BINANCE_BASE_URL}/api/v3/ticker/price?symbol={symbol}", 5): symbol for symbol in symbols}
+            prices = {}
+            errors = {}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    row = future.result()
+                    prices[symbol] = float(row["price"])
+                except Exception as exc:
+                    errors[symbol] = str(exc)[:240]
+            return prices, errors
     rows = request_json(f"{BINANCE_BASE_URL}/api/v3/ticker/price", timeout=10)
-    return {r["symbol"]: float(r["price"]) for r in rows if isinstance(r, dict) and r.get("symbol") and r.get("price")}
+    return {r["symbol"]: float(r["price"]) for r in rows if isinstance(r, dict) and r.get("symbol") and r.get("price")}, {}
+
+
+def fetch_candle_map(symbol_starts):
+    """Fetch each unique symbol once per cycle, even when many signals share it."""
+    results = {}
+    errors = {}
+    if not symbol_starts:
+        return results, {}
+    with ThreadPoolExecutor(max_workers=min(32, len(symbol_starts))) as pool:
+        futures = {pool.submit(fetch_candles, symbol, start): symbol for symbol, start in symbol_starts.items()}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                results[symbol] = future.result()
+            except Exception as exc:
+                results[symbol] = []
+                error = str(exc)[:240]
+                # Return per-symbol errors so one unavailable pair does not hide healthy prices.
+                errors[symbol] = error
+    return results, errors
 
 
 def fetch_candles(symbol, start_ms):
     query = urlencode({"symbol": symbol, "interval": "1m", "startTime": max(0, start_ms), "limit": 100})
-    rows = request_json(f"{BINANCE_BASE_URL}/api/v3/klines?{query}", timeout=10)
+    rows = request_json(f"{BINANCE_BASE_URL}/api/v3/klines?{query}", timeout=5)
     return rows if isinstance(rows, list) else []
 
 
@@ -226,6 +261,9 @@ def run_cycle(state):
             if sid in watchlist:
                 watchlist[sid]["signal"] = signal
             continue
+        symbol = binance_symbol(signal)
+        # The state maps are keyed by signal_id, so a signal can have at most
+        # one watcher or one open paper trade, while separate signals remain independent.
         timing = signal.get("timing") or {}
         created_ms = parse_time_ms(timing.get("created_at")) or int(time.time() * 1000)
         # Ignore the signal's partial creation minute so earlier price action cannot count as an entry.
@@ -246,25 +284,44 @@ def run_cycle(state):
     needed.discard("")
     prices = {}
     try:
-        all_prices = fetch_prices()
-        prices = {symbol: all_prices[symbol] for symbol in needed if symbol in all_prices}
-        state["market_state"] = "connected"
-        state["market_error"] = None
+        prices, price_errors = fetch_prices(sorted(needed))
+        if price_errors:
+            state["market_state"] = "degraded"
+            state["market_error"] = next(iter(price_errors.values()))
+        else:
+            state["market_state"] = "connected"
+            state["market_error"] = None
+        if prices:
+            state["market_last_success_at"] = now
     except Exception as exc:
         state["market_state"] = "degraded" if state.get("market_last_success_at") else "disconnected"
         state["market_error"] = str(exc)[:240]
-    if prices:
+
+    symbol_starts = {}
+    for watch in watchlist.values():
+        symbol = binance_symbol(watch["signal"])
+        if symbol:
+            start = int(watch["last_bar_open_ms"]) + 60000
+            symbol_starts[symbol] = min(start, symbol_starts.get(symbol, start))
+    for trade in active.values():
+        symbol = binance_symbol(trade["signal"])
+        if symbol:
+            start = int(trade["last_bar_open_ms"]) + 60000
+            symbol_starts[symbol] = min(start, symbol_starts.get(symbol, start))
+    errors = {}
+    candle_map, errors = fetch_candle_map(symbol_starts)
+    if errors:
+        state["market_state"] = "degraded"
+        state["market_error"] = next(iter(errors.values()))
+    elif candle_map or prices:
+        state["market_state"] = "connected"
+        state["market_error"] = None
         state["market_last_success_at"] = now
 
     for sid, watch in list(watchlist.items()):
         symbol = binance_symbol(watch["signal"])
         plan = watch["plan"]
-        try:
-            candles = fetch_candles(symbol, int(watch["last_bar_open_ms"]) + 60000)
-        except Exception as exc:
-            state["market_state"] = "degraded"
-            state["market_error"] = str(exc)[:240]
-            candles = []
+        candles = candle_map.get(symbol, [])
 
         for candle in candles:
             open_ms = int(candle[0])
@@ -304,12 +361,7 @@ def run_cycle(state):
 
     for sid, trade in list(active.items()):
         symbol = binance_symbol(trade["signal"])
-        try:
-            candles = fetch_candles(symbol, int(trade["last_bar_open_ms"]) + 60000)
-        except Exception as exc:
-            state["market_state"] = "degraded"
-            state["market_error"] = str(exc)[:240]
-            candles = []
+        candles = candle_map.get(symbol, [])
         closed = False
         for candle in candles:
             if int(candle[0]) <= int(trade["last_bar_open_ms"]) or int(candle[6]) > int(time.time() * 1000):

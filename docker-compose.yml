@@ -29,7 +29,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - SCANNER_SIGNALS_URL=https://scanner.purequantai.xyz/api/v2/signals?actionable=true
-      - BINANCE_BASE_URL=https://api.binance.com
+      - BINANCE_BASE_URL=https://data-api.binance.vision
       - PAPER_MONITOR_POLL_SECONDS=15
       - PAPER_FEE_PERCENT_PER_SIDE=0.1
       - PAPER_MONITOR_STATE_PATH=/app/monitoring/paper_trades.json

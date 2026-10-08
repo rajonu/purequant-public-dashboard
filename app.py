@@ -278,7 +278,7 @@ HTML_TEMPLATE = """
                 <span id="badge-active-count" class="px-2 py-0.5 text-xs rounded-full bg-yellow-500/20 text-yellow-300">{{ metrics.active_signals|length }}</span>
             </button>
             <button onclick="switchTab('history')" id="tab-btn-history" class="tab-btn px-4 py-2 text-sm font-bold flex items-center gap-2">
-                <span>📜 Signal History (PnL %)</span>
+                <span>📜 Trade History (PnL %)</span>
                 <span id="badge-history-count" class="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-300">20 of {{ metrics.closed_signals|length }}</span>
             </button>
             <button onclick="switchTab('trades')" id="tab-btn-trades" class="tab-btn px-4 py-2 text-sm font-bold flex items-center gap-2">
@@ -300,6 +300,7 @@ HTML_TEMPLATE = """
             <div class="px-4 py-3 border-b border-[#30363d] bg-[#161b22]">
                 <div class="text-xs font-bold text-white">Paper Monitored Trades</div>
                 <div id="paper-fee-note" class="text-[11px] text-[#8b949e] mt-1">Paper only • signal reference entries • Binance spot prices • TP1 arms break-even; TP3 closes • no partial exits</div>
+                <div id="paper-market-status" class="text-[11px] text-[#8b949e] mt-1">Price feed: checking</div>
             </div>
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
@@ -366,7 +367,7 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
-        <!-- Tab 2: Signal History -->
+        <!-- Tab 2: Trade History -->
         <div id="tab-content-history" class="card overflow-hidden hidden">
             <div class="overflow-x-auto">
                 <table class="w-full text-left text-xs">
@@ -405,7 +406,7 @@ HTML_TEMPLATE = """
             <!-- Pagination & Load More Footer -->
             <div class="p-3.5 bg-[#161b22] border-t border-[#30363d] flex flex-col sm:flex-row items-center justify-between gap-3 text-xs">
                 <div class="text-[#8b949e]">
-                    Showing <span id="history-showing-range" class="font-bold text-white">1-20</span> of <span id="history-total-count" class="font-bold text-white">{{ metrics.closed_signals|length }}</span> recorded signals
+                    Showing <span id="history-showing-range" class="font-bold text-white">1-20</span> of <span id="history-total-count" class="font-bold text-white">{{ metrics.closed_signals|length }}</span> closed trades
                 </div>
                 <div class="flex items-center gap-2">
                     <button onclick="prevHistoryPage()" id="btn-history-prev" class="px-3 py-1.5 rounded bg-[#21262d] border border-[#30363d] text-[#8b949e] hover:bg-[#30363d] hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed" disabled>
@@ -475,7 +476,7 @@ HTML_TEMPLATE = """
     <script>
         let currentTab = 'active';
 
-        // Pagination & Load More State for Signal History
+        // Pagination & Load More State for Trade History
         let cachedClosedSignals = [];
         let historyCurrentPage = 1;
         const historyPageSize = 20;
@@ -511,7 +512,7 @@ HTML_TEMPLATE = """
             let rows = '';
             displaySignals.forEach(t => {
                 const dirBg = (t.direction === 'BUY' || t.direction === 'LONG') ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400';
-                const statusBg = t.status === 'TP' || t.status === 'WIN' ? 'bg-emerald-500/20 text-emerald-400' : (t.status === 'BREAKEVEN' ? 'bg-yellow-500/20 text-yellow-400' : (t.status === 'NOT ENTERED' ? 'bg-slate-500/20 text-slate-300' : 'bg-red-500/20 text-red-400'));
+                const statusBg = t.status === 'TP' || t.status === 'WIN' ? 'bg-emerald-500/20 text-emerald-400' : (t.status === 'BREAKEVEN' ? 'bg-yellow-500/20 text-yellow-400' : 'bg-red-500/20 text-red-400');
                 const pnlClass = t.pnl_pct > 0 ? 'text-emerald-400' : (t.pnl_pct < 0 ? 'text-red-400' : 'text-[#8b949e]');
                 const pnlSign = t.pnl_pct > 0 ? '+' : '';
 
@@ -650,10 +651,17 @@ HTML_TEMPLATE = """
                 const response = await fetch('/api/paper-trades', {cache: 'no-store'});
                 const data = await response.json();
                 renderPaperTrades(Array.isArray(data.active_trades) ? data.active_trades : []);
-                cachedClosedSignals = Array.isArray(data.history) ? data.history.slice(0, 100) : [];
+                cachedClosedSignals = Array.isArray(data.history) ? data.history.filter(t => t.status !== 'NOT ENTERED').slice(0, 100) : [];
                 renderHistoryTable();
                 const feeNote = document.getElementById('paper-fee-note');
                 if (feeNote) feeNote.innerText = `Paper only • Binance spot prices • estimated fees ${Number(data.fee_per_side_pct || 0).toFixed(2)}% per side • TP1 arms break-even; TP3 closes; no partial exits`;
+                const marketStatus = document.getElementById('paper-market-status');
+                if (marketStatus) {
+                    const market = String(data.market_state || 'disconnected').toUpperCase();
+                    const last = data.market_last_success_at ? ` • last price update ${data.market_last_success_at.slice(0, 19).replace('T', ' ')} UTC` : '';
+                    marketStatus.innerText = `Price feed: ${market}${last}${data.market_error ? ' • ' + data.market_error : ''}`;
+                    marketStatus.className = `text-[11px] mt-1 ${market === 'CONNECTED' ? 'text-emerald-400' : 'text-red-400'}`;
+                }
                 const syncTimeEl = document.getElementById('footer-sync-time');
                 if (syncTimeEl && data.updated_at) syncTimeEl.innerText = 'Monitor: ' + data.updated_at.slice(0, 19).replace('T', ' ') + ' UTC';
             } catch (err) {
@@ -813,7 +821,9 @@ def paper_trades():
         "fee_per_side_pct": state.get("fee_per_side_pct", 0.1),
         "watchlist": state.get("watchlist", []),
         "active_trades": state.get("active_trades", []),
-        "history": history[:100],
+        "market_last_success_at": state.get("market_last_success_at"),
+        "market_error": state.get("market_error"),
+        "history": [item for item in history if item.get("status") != "NOT ENTERED"][:100],
     }), 200
 
 if __name__ == "__main__":
