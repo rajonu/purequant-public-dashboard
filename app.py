@@ -250,7 +250,7 @@ HTML_TEMPLATE = """
                     <span class="text-[10px] font-black px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300">PAPER</span>
                 </div>
                 <div id="active-trades-count" class="text-2xl font-black text-cyan-300 mt-1">0 Open</div>
-                <div class="text-[11px] text-[#8b949e] mt-1">Price and PnL monitoring</div>
+                <div id="active-trades-pnl" class="text-[11px] text-[#8b949e] mt-1">Running net PnL (Σ trade %): —</div>
             </div>
 
             <div class="card p-4 border-purple-500/40">
@@ -299,7 +299,7 @@ HTML_TEMPLATE = """
         <div id="tab-content-trades" class="card overflow-hidden hidden">
             <div class="px-4 py-3 border-b border-[#30363d] bg-[#161b22]">
                 <div class="text-xs font-bold text-white">Paper Monitored Trades</div>
-                <div id="paper-fee-note" class="text-[11px] text-[#8b949e] mt-1">Paper only • signal reference entries • Binance spot prices • TP1 arms break-even; TP3 closes • no partial exits</div>
+                <div id="paper-fee-note" class="text-[11px] text-[#8b949e] mt-1">Paper only • signal reference entries • Binance spot prices • TP1 arms break-even; TP3 closes • 8h max hold • no partial exits</div>
                 <div id="paper-market-status" class="text-[11px] text-[#8b949e] mt-1">Price feed: checking</div>
             </div>
             <div class="overflow-x-auto">
@@ -650,11 +650,11 @@ HTML_TEMPLATE = """
             try {
                 const response = await fetch('/api/paper-trades', {cache: 'no-store'});
                 const data = await response.json();
-                renderPaperTrades(Array.isArray(data.active_trades) ? data.active_trades : []);
+                renderPaperTrades(Array.isArray(data.active_trades) ? data.active_trades : [], data.total_live_net_pnl_pct);
                 cachedClosedSignals = Array.isArray(data.history) ? data.history.filter(t => t.status !== 'NOT ENTERED').slice(0, 100) : [];
                 renderHistoryTable();
                 const feeNote = document.getElementById('paper-fee-note');
-                if (feeNote) feeNote.innerText = `Paper only • Binance spot prices • estimated fees ${Number(data.fee_per_side_pct || 0).toFixed(2)}% per side • TP1 arms break-even; TP3 closes; no partial exits`;
+                if (feeNote) feeNote.innerText = `Paper only • Binance spot prices • estimated fees ${Number(data.fee_per_side_pct || 0).toFixed(2)}% per side • TP1 arms break-even; TP3 closes; 8h max hold; no partial exits`;
                 const marketStatus = document.getElementById('paper-market-status');
                 if (marketStatus) {
                     const market = String(data.market_state || 'disconnected').toUpperCase();
@@ -674,13 +674,19 @@ HTML_TEMPLATE = """
             return Number.isFinite(n) ? `${n > 0 ? '+' : ''}${n.toFixed(2)}%` : '—';
         }
 
-        function renderPaperTrades(trades) {
+        function renderPaperTrades(trades, totalNetPnl) {
             const tbody = document.getElementById('paper-trades-tbody');
             const empty = document.getElementById('paper-trades-empty');
             const badge = document.getElementById('badge-paper-trades');
             const summary = document.getElementById('active-trades-count');
             if (badge) badge.innerText = trades.length;
             if (summary) summary.innerText = `${trades.length} Open`;
+            const pnlSummary = document.getElementById('active-trades-pnl');
+            if (pnlSummary) {
+                const total = Number(totalNetPnl);
+                pnlSummary.innerText = `Running net PnL (Σ trade %): ${Number.isFinite(total) ? formatPct(total) : '—'}`;
+                pnlSummary.className = `text-[11px] mt-1 ${total > 0 ? 'text-emerald-400' : total < 0 ? 'text-red-400' : 'text-[#8b949e]'}`;
+            }
             if (empty) empty.classList.toggle('hidden', trades.length > 0);
             if (!tbody) return;
             tbody.innerHTML = trades.map(trade => {
@@ -821,6 +827,7 @@ def paper_trades():
         "fee_per_side_pct": state.get("fee_per_side_pct", 0.1),
         "watchlist": state.get("watchlist", []),
         "active_trades": state.get("active_trades", []),
+        "total_live_net_pnl_pct": round(sum(float(t.get("live_net_pnl_pct", 0)) for t in state.get("active_trades", []) if isinstance(t.get("live_net_pnl_pct"), (int, float))), 4),
         "market_last_success_at": state.get("market_last_success_at"),
         "market_error": state.get("market_error"),
         "history": [item for item in history if item.get("status") != "NOT ENTERED"][:100],

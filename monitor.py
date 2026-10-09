@@ -18,6 +18,7 @@ BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.visio
 STATE_PATH = Path(os.getenv("PAPER_MONITOR_STATE_PATH", "/app/monitoring/paper_trades.json"))
 POLL_SECONDS = max(5, int(os.getenv("PAPER_MONITOR_POLL_SECONDS", "15")))
 FEE_PER_SIDE_PCT = max(0.0, float(os.getenv("PAPER_FEE_PERCENT_PER_SIDE", "0.1")))
+MAX_TRADE_HOURS = max(1.0, float(os.getenv("PAPER_MAX_TRADE_HOURS", "8")))
 USER_AGENT = "PureQuantPublicDashboardPaperMonitor/1.0"
 
 
@@ -392,6 +393,25 @@ def run_cycle(state):
                 break
         if closed:
             continue
+        opened_ms = parse_time_ms(trade.get("opened_at"))
+        age_ms = int(time.time() * 1000) - opened_ms if opened_ms else 0
+        if age_ms >= MAX_TRADE_HOURS * 60 * 60 * 1000:
+            # Time exits require a recent market observation; never close at an old quote.
+            last_price_ms = parse_time_ms(trade.get("last_price_at"))
+            has_fresh_price = symbol in prices
+            has_fresh_candle = int(time.time() * 1000) - int(trade.get("last_bar_open_ms", 0)) <= 5 * 60 * 1000
+            if has_fresh_price:
+                exit_price = prices[symbol]
+                exit_time = now
+            elif has_fresh_candle:
+                exit_price = float(trade.get("current_price", 0))
+                exit_time = trade.get("last_price_at") or now
+            else:
+                exit_price = None
+            if exit_price and (has_fresh_price or (last_price_ms and int(time.time() * 1000) - last_price_ms <= 5 * 60 * 1000)):
+                close_trade(state, trade, "TIMEOUT", exit_price, exit_time)
+                del active[sid]
+                continue
         if symbol in prices:
             current = prices[symbol]
             trade["current_price"] = current

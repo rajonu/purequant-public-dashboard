@@ -32,6 +32,7 @@ services:
       - BINANCE_BASE_URL=https://data-api.binance.vision
       - PAPER_MONITOR_POLL_SECONDS=15
       - PAPER_FEE_PERCENT_PER_SIDE=0.1
+      - PAPER_MAX_TRADE_HOURS=8
       - PAPER_MONITOR_STATE_PATH=/app/monitoring/paper_trades.json
     security_opt:
       - no-new-privileges:true
